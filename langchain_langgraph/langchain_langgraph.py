@@ -17,7 +17,7 @@ from langchain.agents import create_agent
 
 from langchain_mcp_adapters.sessions import Connection
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
 
 try:
     from ddgs import DDGS
@@ -148,6 +148,7 @@ def _build_chat_model(model_name: str | None = None) -> ChatGroq:
         model_name=model_name or DEFAULT_GROQ_MODEL,
         groq_api_key=api_key,
         temperature=0.0,
+        streaming=True,
     )
 
 STRICT_TOOL_PROMPT = (
@@ -192,55 +193,52 @@ async def run_agent(prompt_text: str, model_name: str | None = None) -> dict[str
 async def stream_response(
     prompt_text: str, model_name: str | None = None
 ) -> AsyncIterator[dict[str, object]]:
-    """Stream agent output chunks with response/tool fields."""
+    """Stream tools + final text; tokens via 'messages', steps via 'updates'."""
     agent = await build_react_agent(model_name)
-    seen_text = ""
     seen_tools: set[str] = set()
 
-    async for update in agent.astream({"messages": [HumanMessage(content=prompt_text)]}):
-        for _, payload in update.items():
-            if not isinstance(payload, dict):
-                continue
-            messages = payload.get("messages")
-            if not messages:
-                continue
+    async for mode, chunk in agent.astream(
+        {"messages": [HumanMessage(content=prompt_text)]},
+        stream_mode=["updates", "messages"],
+    ):
+        if mode == "messages":
+            token_chunk, _metadata = chunk if isinstance(chunk, tuple) else (chunk, None)
+            if isinstance(token_chunk, AIMessageChunk) and token_chunk.content:
+                yield {"text": token_chunk.content, "field": "response", "done": False}
+            continue
 
-            last = messages[-1]
+        for _, payload in chunk.items():
+            msgs = payload.get("messages") or []
+            if not msgs:
+                continue
+            last = msgs[-1]
+
             if isinstance(last, ToolMessage):
-                name = getattr(last, "name", "")
+                name = getattr(last, "name", "") or getattr(last, "tool_name", "")
                 if name and name not in seen_tools:
                     seen_tools.add(name)
                     yield {"text": name, "field": "used_tools", "done": False}
                 continue
 
-            if isinstance(last, AIMessage):
-                text_content = last.content
-                if isinstance(text_content, list):
-                    text_content = "".join(
-                        part.get("text", "")
-                        if isinstance(part, dict)
-                        else str(part)
-                        for part in text_content
-                    )
-                if not text_content:
-                    continue
-
-                text_content = str(text_content)
-                delta = (
-                    text_content[len(seen_text) :]
-                    if text_content.startswith(seen_text)
-                    else text_content
-                )
-                if delta:
-                    seen_text = text_content
-                    yield {"text": delta, "field": "response", "done": False}
-
     yield {"text": "", "field": "response", "done": True}
 
+
 async def _preview_stream(prompt: str):
+    printed_response = False
     async for event in stream_response(prompt):
-        print(event)
+        text = event["text"]
+        if not text:
+            continue
+        field = event.get("field")
+        if field == "used_tools":
+            print(f"[used_tools] {text}")
+            continue
+        if field == "response":
+            print(text, end="", flush=True)
+            printed_response = True
+    if printed_response:
+        print()
 
 if __name__ == "__main__":
-    user_prompt = "who is donald trump?"
+    user_prompt = "add 789 to 1546"
     asyncio.run(_preview_stream(user_prompt))
