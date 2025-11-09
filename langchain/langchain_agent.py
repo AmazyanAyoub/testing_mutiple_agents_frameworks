@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
 from datetime import datetime, timezone
 from collections.abc import AsyncIterator
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from dotenv import load_dotenv
 # from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -24,8 +25,9 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     DDGS = None
 
-
 load_dotenv()
+
+
 
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 MAX_WEB_RESULTS = 1
@@ -113,27 +115,48 @@ builtin_tools = [
 ]
 
 
-def _get_mcp_server_url() -> str:
-    """Read the MCP server URL from the environment."""
-    server_url = os.getenv("MCP_URL")
-    if not server_url:
-        raise RuntimeError(
-            "MCP_URL environment variable is not set. "
-            "Update your .env file with MCP_URL pointing to the MCP HTTP endpoint."
-        )
-    return server_url.strip()
+# def _get_mcp_server_url() -> str:
+#     """Read the MCP server URL from the environment."""
+#     server_url = os.getenv("MCP_URL")
+#     if not server_url:
+#         raise RuntimeError(
+#             "MCP_URL environment variable is not set. "
+#             "Update your .env file with MCP_URL pointing to the MCP HTTP endpoint."
+#         )
+#     return server_url.strip()
 
-def _get_mcp_connection() -> Connection:
-    """Build the connection parameters used for MCP tool access."""
-    return {
-        "transport": "streamable_http",
-        "url": _get_mcp_server_url(),
-    }
+# def _get_mcp_connection() -> Connection:
+#     """Build the connection parameters used for MCP tool access."""
+#     return {
+#         "transport": "streamable_http",
+#         "url": _get_mcp_server_url(),
+#     }
+
+def _normalize_mcp_urls(urls: str | Iterable[str] | None = None) -> list[Connection]:
+    if urls is None:
+        env_url = os.getenv("MCP_URL")
+        urls = ast.literal_eval(env_url)
+        return [
+            {"transport": "streamable_http", "url": u.strip()}
+            for u in urls
+            if u and u.strip()
+        ]
+        
+    if isinstance(urls, str):
+        urls = [urls]
+
+    return [
+        {"transport": "streamable_http", "url": u.strip()}
+        for u in urls
+        if u and u.strip()
+    ]
 
 
 async def gather_all_tools() -> List[BaseTool]:
-    connection = _get_mcp_connection()
-    mcp_tools = await load_mcp_tools(session=None, connection=connection)
+    connections = _normalize_mcp_urls()
+    mcp_tools = []
+    for conn in connections:
+        mcp_tools.extend(await load_mcp_tools(session=None, connection=conn))
     return [*builtin_tools, *mcp_tools]
 
 
@@ -240,5 +263,5 @@ async def _preview_stream(prompt: str):
         print()
 
 if __name__ == "__main__":
-    user_prompt = "add 789 to 1546"
-    asyncio.run(_preview_stream(user_prompt))
+    user_prompt = "what is the status of the reference ARR 24/09/2012?"
+    print(asyncio.run(run_agent(user_prompt)))
