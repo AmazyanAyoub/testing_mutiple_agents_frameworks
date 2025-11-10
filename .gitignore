@@ -2,3 +2,7 @@
 data/
 
 *.ipynb
+
+logs
+
+__pycache__

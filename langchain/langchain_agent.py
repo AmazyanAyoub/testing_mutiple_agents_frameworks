@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import ast
-import asyncio
-import json
-import os
+import ast, asyncio, json, os
 from datetime import datetime, timezone
 from collections.abc import AsyncIterator
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 # from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -25,8 +22,9 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     DDGS = None
 
-load_dotenv()
+from midleware_lanchain import retry_failed_tools, FullLoggingMiddleware
 
+load_dotenv()
 
 
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
@@ -171,7 +169,7 @@ def _build_chat_model(model_name: str | None = None) -> ChatGroq:
         model_name=model_name or DEFAULT_GROQ_MODEL,
         groq_api_key=api_key,
         temperature=0.0,
-        streaming=True,
+        # streaming=True
     )
 
 STRICT_TOOL_PROMPT = (
@@ -194,7 +192,14 @@ STRICT_TOOL_PROMPT = (
 async def build_react_agent(model_name: str | None = None):
     llm = _build_chat_model(model_name)
     tools = await gather_all_tools()
-    return create_agent(llm, tools, system_prompt=STRICT_TOOL_PROMPT)
+    return create_agent(
+        llm, 
+        tools, 
+        system_prompt=STRICT_TOOL_PROMPT, 
+        middleware=[
+             FullLoggingMiddleware(),
+             retry_failed_tools,
+    ])
 
 async def run_agent(prompt_text: str, model_name: str | None = None) -> dict[str, object]:
     agent = await build_react_agent(model_name)
@@ -213,6 +218,38 @@ async def run_agent(prompt_text: str, model_name: str | None = None) -> dict[str
     return {"answer": answer, "tool_calls": tool_calls}
 
 
+# async def stream_response(
+#     prompt_text: str, model_name: str | None = None
+# ) -> AsyncIterator[dict[str, object]]:
+#     """Stream tools + final text; tokens via 'messages', steps via 'updates'."""
+#     agent = await build_react_agent(model_name)
+#     seen_tools: set[str] = set()
+
+#     async for mode, chunk in agent.astream(
+#         {"messages": [HumanMessage(content=prompt_text)]},
+#         stream_mode=["updates", "messages"],
+#     ):
+#         if mode == "messages":
+#             token_chunk, _metadata = chunk if isinstance(chunk, tuple) else (chunk, None)
+#             if isinstance(token_chunk, AIMessageChunk) and token_chunk.content:
+#                 yield {"text": token_chunk.content, "field": "response", "done": False}
+#             continue
+
+#         for _, payload in chunk.items():
+#             msgs = payload.get("messages") or []
+#             if not msgs:
+#                 continue
+#             last = msgs[-1]
+
+#             if isinstance(last, ToolMessage):
+#                 name = getattr(last, "name", "") or getattr(last, "tool_name", "")
+#                 if name and name not in seen_tools:
+#                     seen_tools.add(name)
+#                     yield {"text": name, "field": "used_tools", "done": False}
+#                 continue
+
+#     yield {"text": "", "field": "response", "done": True}
+
 async def stream_response(
     prompt_text: str, model_name: str | None = None
 ) -> AsyncIterator[dict[str, object]]:
@@ -224,16 +261,32 @@ async def stream_response(
         {"messages": [HumanMessage(content=prompt_text)]},
         stream_mode=["updates", "messages"],
     ):
+        # 1) Token streaming from model
         if mode == "messages":
-            token_chunk, _metadata = chunk if isinstance(chunk, tuple) else (chunk, None)
+            token_chunk, _metadata = (
+                chunk if isinstance(chunk, tuple) else (chunk, None)
+            )
             if isinstance(token_chunk, AIMessageChunk) and token_chunk.content:
                 yield {"text": token_chunk.content, "field": "response", "done": False}
             continue
 
+        # 2) Node / tool updates
+        # Sometimes `chunk` is not a dict, or values can be None
+        if not isinstance(chunk, dict):
+            # optional: print for debug
+            # print("Non-dict update chunk:", chunk)
+            continue
+
         for _, payload in chunk.items():
+            if payload is None or not isinstance(payload, dict):
+                # optional debug:
+                # print("Skipping payload:", payload)
+                continue
+
             msgs = payload.get("messages") or []
             if not msgs:
                 continue
+
             last = msgs[-1]
 
             if isinstance(last, ToolMessage):
@@ -241,27 +294,32 @@ async def stream_response(
                 if name and name not in seen_tools:
                     seen_tools.add(name)
                     yield {"text": name, "field": "used_tools", "done": False}
-                continue
 
+    # end-of-stream marker
     yield {"text": "", "field": "response", "done": True}
 
 
-async def _preview_stream(prompt: str):
-    printed_response = False
-    async for event in stream_response(prompt):
-        text = event["text"]
-        if not text:
-            continue
-        field = event.get("field")
-        if field == "used_tools":
-            print(f"[used_tools] {text}")
-            continue
-        if field == "response":
-            print(text, end="", flush=True)
-            printed_response = True
-    if printed_response:
-        print()
+
+async def main():
+    user_prompt = "what is the status of the reference ARR 24/09/2012 and what is the addition of 9849 and 4561?"
+
+    async for chunk in stream_response(user_prompt):
+        print(chunk)
+
 
 if __name__ == "__main__":
-    user_prompt = "what is the status of the reference ARR 24/09/2012?"
-    print(asyncio.run(run_agent(user_prompt)))
+    asyncio.run(main())
+
+# if __name__ == "__main__":
+#     prompt = "what is the status of the reference ARR 24/09/2012 and what is the addition of 9849 and 4561?"
+
+#     # normal (non-streaming) run
+#     final = asyncio.run(run_agent(prompt))
+#     print("Answer:", final["answer"])
+#     print("Steps:", final["tool_calls"])
+
+#     # streaming run
+#     async def preview():
+#         async for chunk in stream_response(prompt):
+#             print(chunk)
+#     asyncio.run(preview())
