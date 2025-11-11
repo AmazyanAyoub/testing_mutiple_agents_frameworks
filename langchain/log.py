@@ -16,3 +16,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("agent_logger")
+
+for name in ["httpx", "httpcore", "urllib3", "openai", "langchain", "langgraph"]:
+    logging.getLogger(name).setLevel(logging.WARNING)

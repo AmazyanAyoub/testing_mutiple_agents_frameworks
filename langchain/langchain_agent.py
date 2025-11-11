@@ -31,10 +31,22 @@ DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 MAX_WEB_RESULTS = 1
 
 
+# CURRENT_TIME_SCHEMA: Dict[str, Any] = {
+#     "type": "object",
+#     "properties": {},
+#     "required": [],
+#     "description": "No arguments required.",
+# }
+
 CURRENT_TIME_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "properties": {},
-    "required": [],
+    "properties": {
+        "reason": {
+            "type": "string",
+            "description": "Optional free-text reason for calling this tool. The model can put anything here.",
+        },
+    },
+    "required": [],  # `reason` is optional
 }
 
 WEB_SEARCH_SCHEMA: Dict[str, Any] = {
@@ -100,7 +112,7 @@ async def _web_search_coroutine(query: str, max_results: int = 1) -> str:
 builtin_tools = [
     StructuredTool(
         name="current_time",
-        description="Return the current UTC time in ISO 8601 format.",
+        description="Returns the current UTC time. Call it whenever the user asks for the current time, date, or 'now'.",
         args_schema=CURRENT_TIME_SCHEMA,
         coroutine=_current_time_coroutine,
     ),
@@ -111,24 +123,6 @@ builtin_tools = [
         coroutine=_web_search_coroutine,
     ),
 ]
-
-
-# def _get_mcp_server_url() -> str:
-#     """Read the MCP server URL from the environment."""
-#     server_url = os.getenv("MCP_URL")
-#     if not server_url:
-#         raise RuntimeError(
-#             "MCP_URL environment variable is not set. "
-#             "Update your .env file with MCP_URL pointing to the MCP HTTP endpoint."
-#         )
-#     return server_url.strip()
-
-# def _get_mcp_connection() -> Connection:
-#     """Build the connection parameters used for MCP tool access."""
-#     return {
-#         "transport": "streamable_http",
-#         "url": _get_mcp_server_url(),
-#     }
 
 def _normalize_mcp_urls(urls: str | Iterable[str] | None = None) -> list[Connection]:
     if urls is None:
@@ -169,7 +163,7 @@ def _build_chat_model(model_name: str | None = None) -> ChatGroq:
         model_name=model_name or DEFAULT_GROQ_MODEL,
         groq_api_key=api_key,
         temperature=0.0,
-        # streaming=True
+        streaming=True
     )
 
 STRICT_TOOL_PROMPT = (
@@ -216,39 +210,6 @@ async def run_agent(prompt_text: str, model_name: str | None = None) -> dict[str
         if isinstance(msg, ToolMessage)
     ]
     return {"answer": answer, "tool_calls": tool_calls}
-
-
-# async def stream_response(
-#     prompt_text: str, model_name: str | None = None
-# ) -> AsyncIterator[dict[str, object]]:
-#     """Stream tools + final text; tokens via 'messages', steps via 'updates'."""
-#     agent = await build_react_agent(model_name)
-#     seen_tools: set[str] = set()
-
-#     async for mode, chunk in agent.astream(
-#         {"messages": [HumanMessage(content=prompt_text)]},
-#         stream_mode=["updates", "messages"],
-#     ):
-#         if mode == "messages":
-#             token_chunk, _metadata = chunk if isinstance(chunk, tuple) else (chunk, None)
-#             if isinstance(token_chunk, AIMessageChunk) and token_chunk.content:
-#                 yield {"text": token_chunk.content, "field": "response", "done": False}
-#             continue
-
-#         for _, payload in chunk.items():
-#             msgs = payload.get("messages") or []
-#             if not msgs:
-#                 continue
-#             last = msgs[-1]
-
-#             if isinstance(last, ToolMessage):
-#                 name = getattr(last, "name", "") or getattr(last, "tool_name", "")
-#                 if name and name not in seen_tools:
-#                     seen_tools.add(name)
-#                     yield {"text": name, "field": "used_tools", "done": False}
-#                 continue
-
-#     yield {"text": "", "field": "response", "done": True}
 
 async def stream_response(
     prompt_text: str, model_name: str | None = None
@@ -301,7 +262,7 @@ async def stream_response(
 
 
 async def main():
-    user_prompt = "what is the status of the reference ARR 24/09/2012 and what is the addition of 9849 and 4561?"
+    user_prompt = "what is the current time?"
 
     async for chunk in stream_response(user_prompt):
         print(chunk)
@@ -309,17 +270,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# if __name__ == "__main__":
-#     prompt = "what is the status of the reference ARR 24/09/2012 and what is the addition of 9849 and 4561?"
-
-#     # normal (non-streaming) run
-#     final = asyncio.run(run_agent(prompt))
-#     print("Answer:", final["answer"])
-#     print("Steps:", final["tool_calls"])
-
-#     # streaming run
-#     async def preview():
-#         async for chunk in stream_response(prompt):
-#             print(chunk)
-#     asyncio.run(preview())
