@@ -9,7 +9,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8"),
         # If you don't want console logs, comment this out:
         logging.StreamHandler()
     ],
@@ -17,5 +17,5 @@ logging.basicConfig(
 
 logger = logging.getLogger("agent_logger")
 
-for name in ["httpx", "httpcore", "urllib3", "openai", "langchain", "langgraph"]:
+for name in ["httpx", "httpcore", "urllib3", "openai", "langchain", "langgraph", "mcp"]:
     logging.getLogger(name).setLevel(logging.WARNING)
