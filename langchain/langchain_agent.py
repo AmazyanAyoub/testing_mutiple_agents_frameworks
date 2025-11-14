@@ -22,7 +22,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     DDGS = None
 
-from midleware_lanchain import retry_failed_tools, FullLoggingMiddleware
+from midleware_lanchain import retry_failed_tools, FullLoggingMiddleware, model_limit, reg_limit
 
 load_dotenv()
 
@@ -175,7 +175,12 @@ STRICT_TOOL_PROMPT = (
     "Call it for news, biographies, historical facts, stats, or anything requiring up-to-date knowledge. "
     "Always read the snippets before answering.\n"
     "- MCP math tools (`add`, `subtract`, `multiply`, `divide`, `sin`): These are authoritative for arithmetic "
+    "- MCP regulation tool (`lookup_regulation`): Fetch the official status/metadata for a regulation code (e.g., “AAMI TIR50”); call it at most once per unique code and then finalize the answer without calling tools again."
     "and trig problems. Invoke them for any numeric operation instead of calculating in your head.\n\n"
+    "# condition question:\n"
+    "For any “if/when/unless … then …” request: use tools to evaluate the condition; if TRUE, run the required action via the right tool(s) before answering; if FALSE, say why it wasn’t executed."
+    "Don’t repeat identical tool calls; in the final answer, briefly report the condition result and (if applicable) the action outcome."
+    "Example of a condition question and answer:  “add 4 and 5; if > 8 give current time” → call add(4,5)=9 (>8), then call current_time, then answer with both results."
     "Workflow:\n"
     "1. Decide which tool (or sequence of tools) best supports the request.\n"
     "2. Invoke tool(s) and inspect their outputs.\n"
@@ -191,8 +196,10 @@ async def build_react_agent(model_name: str | None = None):
         tools, 
         system_prompt=STRICT_TOOL_PROMPT, 
         middleware=[
-             FullLoggingMiddleware(),
-             retry_failed_tools,
+            reg_limit,
+            model_limit,
+            FullLoggingMiddleware(),
+            retry_failed_tools
     ])
 
 async def run_agent(prompt_text: str, model_name: str | None = None) -> dict[str, object]:
@@ -262,7 +269,7 @@ async def stream_response(
 
 
 async def main():
-    user_prompt = "what is the current time?"
+    user_prompt = "what is the addition of 789 and 45 if the result > 790 give me the current time?"
 
     async for chunk in stream_response(user_prompt):
         print(chunk)
