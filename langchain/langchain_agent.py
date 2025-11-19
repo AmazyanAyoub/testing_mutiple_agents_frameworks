@@ -27,8 +27,17 @@ from midleware_lanchain import retry_failed_tools, FullLoggingMiddleware, model_
 load_dotenv()
 
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from web_search_tool.search_tool import run_search_with_summary
+
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
-MAX_WEB_RESULTS = 1
+MAX_WEB_RESULTS = 10
 
 
 # CURRENT_TIME_SCHEMA: Dict[str, Any] = {
@@ -49,17 +58,30 @@ CURRENT_TIME_SCHEMA: Dict[str, Any] = {
     "required": [],  # `reason` is optional
 }
 
-WEB_SEARCH_SCHEMA: Dict[str, Any] = {
+# WEB_SEARCH_SCHEMA: Dict[str, Any] = {
+#     "type": "object",
+#     "properties": {
+#         "query": {"type": "string", "description": "Search keywords."},
+#         "max_results": {
+#             "type": "integer",
+#             "description": f"Number of top hits to return (1-{MAX_WEB_RESULTS}).",
+#             "default": 5,
+#         },
+#     },
+#     "required": ["query"],
+# }
+
+WEB_SEARCH_SCHEMA = {
     "type": "object",
     "properties": {
-        "query": {"type": "string", "description": "Search keywords."},
+        "question": {"type": "string", "description": "Research question or topic to investigate via web search."},
         "max_results": {
             "type": "integer",
-            "description": f"Number of top hits to return (1-{MAX_WEB_RESULTS}).",
+            "description": f"Number of results to fetch (1-{MAX_WEB_RESULTS}).",
             "default": 5,
         },
     },
-    "required": ["query"],
+    "required": ["question"],
 }
 
 
@@ -69,44 +91,44 @@ async def _current_time_coroutine() -> str:
     return json.dumps(payload)
 
 
-async def _web_search_coroutine(query: str, max_results: int = 1) -> str:
-    if not query or not query.strip():
-        return json.dumps({"error": "query must not be empty"})
+# async def _web_search_coroutine(query: str, max_results: int = 1) -> str:
+#     if not query or not query.strip():
+#         return json.dumps({"error": "query must not be empty"})
 
-    if DDGS is None:
-        return json.dumps(
-            {
-                "error": "duckduckgo_search package is not installed",
-                "hint": "pip install duckduckgo_search",
-            }
-        )
+#     if DDGS is None:
+#         return json.dumps(
+#             {
+#                 "error": "duckduckgo_search package is not installed",
+#                 "hint": "pip install duckduckgo_search",
+#             }
+#         )
 
-    try:
-        max_results = max(1, min(int(max_results), MAX_WEB_RESULTS))
-    except (TypeError, ValueError):
-        max_results = 5
+#     try:
+#         max_results = max(1, min(int(max_results), MAX_WEB_RESULTS))
+#     except (TypeError, ValueError):
+#         max_results = 5
 
-    loop = asyncio.get_running_loop()
+#     loop = asyncio.get_running_loop()
 
-    def _do_search() -> Dict[str, Any]:
-        results = []
-        with DDGS() as ddg:
-            for item in ddg.text(query, max_results=max_results) or []:
-                results.append(
-                    {
-                        "title": item.get("title", ""),
-                        "url": item.get("href", ""),
-                        "snippet": item.get("body", ""),
-                    }
-                )
-        return {
-            "query": query,
-            "result_count": len(results),
-            "results": results,
-        }
+#     def _do_search() -> Dict[str, Any]:
+#         results = []
+#         with DDGS() as ddg:
+#             for item in ddg.text(query, max_results=max_results) or []:
+#                 results.append(
+#                     {
+#                         "title": item.get("title", ""),
+#                         "url": item.get("href", ""),
+#                         "snippet": item.get("body", ""),
+#                     }
+#                 )
+#         return {
+#             "query": query,
+#             "result_count": len(results),
+#             "results": results,
+#         }
 
-    payload = await loop.run_in_executor(None, _do_search)
-    return json.dumps(payload, ensure_ascii=False)
+#     payload = await loop.run_in_executor(None, _do_search)
+#     return json.dumps(payload, ensure_ascii=False)
 
 
 builtin_tools = [
@@ -118,9 +140,9 @@ builtin_tools = [
     ),
     StructuredTool(
         name="web_search",
-        description="Search DuckDuckGo and return a JSON payload of the top results.",
+        description="Runs a full web search + fetch + summary pipeline and returns per-page summaries (title, URL, bullet list).",
         args_schema=WEB_SEARCH_SCHEMA,
-        coroutine=_web_search_coroutine,
+        coroutine=run_search_with_summary,
     ),
 ]
 
@@ -144,13 +166,12 @@ def _normalize_mcp_urls(urls: str | Iterable[str] | None = None) -> list[Connect
     ]
 
 
-async def gather_all_tools() -> List[BaseTool]:
-    connections = _normalize_mcp_urls()
-    mcp_tools = []
-    for conn in connections:
-        mcp_tools.extend(await load_mcp_tools(session=None, connection=conn))
-    return [*builtin_tools, *mcp_tools]
-
+# async def gather_all_tools() -> List[BaseTool]:
+#     connections = _normalize_mcp_urls()
+#     mcp_tools = []
+#     for conn in connections:
+#         mcp_tools.extend(await load_mcp_tools(session=None, connection=conn))
+#     return [*builtin_tools, *mcp_tools]
 
 def _build_chat_model(model_name: str | None = None) -> ChatGroq:
     api_key = os.getenv("GROQ_API_KEY")
@@ -190,7 +211,7 @@ STRICT_TOOL_PROMPT = (
 )
 async def build_react_agent(model_name: str | None = None):
     llm = _build_chat_model(model_name)
-    tools = await gather_all_tools()
+    tools = [*builtin_tools]
     return create_agent(
         llm, 
         tools, 
@@ -269,7 +290,7 @@ async def stream_response(
 
 
 async def main():
-    user_prompt = "what is the addition of 789 and 45 if the result > 790 give me the current time?"
+    user_prompt = "What were the key findings from the EU Medical Device Coordination Group (MDCG) guidance published in September 2024 about in vitro diagnostic software, and how do they compare with FDA’s latest draft guidance from March 2025?"
 
     async for chunk in stream_response(user_prompt):
         print(chunk)
