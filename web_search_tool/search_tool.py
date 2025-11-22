@@ -1,30 +1,19 @@
-from typing import Any, Dict, List, Tuple, Optional
-import os, json, asyncio, logging, time
-from pathlib import Path
-from pydantic import BaseModel, Field
+import asyncio, json, logging, os, math, time
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_groq import ChatGroq
-from ddgs import DDGS
-from bs4 import BeautifulSoup, Tag
-from playwright.async_api import async_playwright
-from dotenv import load_dotenv
-_= load_dotenv()
+from pydantic import BaseModel, Field
 
+from .prompt import SEARCH_QUERY_PROMPT
+from .filter_html import _extract_clean_text
+from .summarizer import summarize_single_content
+from provider.ddgs_provider import ddgs_search
+from provider.playwright_scraper import fetch_page_html
 
-import sys
-from pathlib import Path
+load_dotenv()
 
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from filter_html import _extract_clean_text
-from web_search_tool.summarizer import summarize_single_content
-from prompt import SEARCH_QUERY_PROMPT
-
-for noisy in ("httpx", "httpcore", "urllib3", "playwright.async_api"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class WebSearchQuerySchema(BaseModel):
@@ -33,7 +22,7 @@ class WebSearchQuerySchema(BaseModel):
         description="Optimized search query string to send to the web search engine.",
     )
 
-def build_search_query_chain() -> Any:
+def build_search_query_chain(llm) -> Any:
     parser = PydanticOutputParser(pydantic_object=WebSearchQuerySchema)
     format_instructions = parser.get_format_instructions()
 
@@ -41,157 +30,186 @@ def build_search_query_chain() -> Any:
         SEARCH_QUERY_PROMPT.strip()
     ).partial(format_instructions=format_instructions)
 
-    llm = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
     return prompt | llm | parser
 
-
-
-async def _web_search_coroutine(query: str, max_results: int = 5) -> str:
-    if not query or not query.strip():
-        return json.dumps({"error": "query must not be empty"})
+async def _run_ddgs(query: str, max_results: int, timelimit: Optional[str]) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: ddgs_search(query=query, max_results=max_results, timelimit=timelimit),
+    )
 
-    def _do_search() -> Dict[str, Any]:
-        results = []
-        with DDGS() as ddg:
-            for item in ddg.text(query, max_results=max_results) or []:
-                results.append(
-                    {
-                        "title": item.get("title", ""),
-                        "url": item.get("href", ""),
-                        "snippet": item.get("body", ""),
-                    }
-                )
-        return {
-            "query": query,
-            "result_count": len(results),
-            "results": results,
-        }
+async def _fetch_pages(urls: List[str], timeout_ms: int = 30000) -> List[Dict[str, Any]]:
+    tasks = [fetch_page_html(url, timeout_ms=timeout_ms) for url in urls]
+    return await asyncio.gather(*tasks) if tasks else []
 
-    payload = await loop.run_in_executor(None, _do_search)
-    return json.dumps(payload, ensure_ascii=False)
 
-async def fetch_clean_page_content(url: str, timeout_ms: int = 30000) -> Dict[str, Any]:
-    if not url or not url.strip():
-        return {
-            "url": url,
-            "status": None,
-            "error": "url must not be empty",
-            "content": "",
-        }
+async def score_results(
+    query: str,
+    results: List[Dict[str, Any]],
+    embedder: Any,              # expects .embed(texts: List[str]) -> List[List[float]]
+    top_k: int = 5,
+    min_score: float = 0.25,    # drop obvious off-topic hits
+) -> List[Dict[str, Any]]:
+    """
+    Compute cosine similarity between query and each result's title+snippet.
+    Returns the top_k results with an added 'similarity' field, sorted desc.
+    Falls back to original ordering on any embedding error.
+    """
+    if not results:
+        return results
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            page = await browser.new_page()
+    try:
+        query_vec = (await embedder.embed([query]))["embeddings"][0]
+        qnorm = math.sqrt(sum(x * x for x in query_vec)) or 1.0
 
-            async def _block_heavy(route, request):
-                if request.resource_type in {"image", "media", "font", "stylesheet"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-                    
-            await page.route("**/*", _block_heavy)
-            response = await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            html = await page.content()
-            clean_text = _extract_clean_text(html)
+        texts = [(r.get("title", "") + " " + r.get("snippet", "")).strip() for r in results]
+        doc_vecs = (await embedder.embed(texts))["embeddings"]
 
-            status = response.status if response is not None else None
+        rescored: List[Dict[str, Any]] = []
+        for r, dv in zip(results, doc_vecs):
+            dnorm = math.sqrt(sum(x * x for x in dv)) or 1.0
+            sim = sum(a * b for a, b in zip(query_vec, dv)) / (qnorm * dnorm)
+            # if sim >= min_score:
+            rescored.append({**r, "similarity": sim})
 
-            return {
-                "url": url,
-                "status": status,
-                "error": None if status and 200 <= status < 400 else f"HTTP {status}",
-                "content": clean_text,
-            }
-        except Exception as exc:
-            return {
-                "url": url,
-                "status": None,
-                "error": str(exc),
-                "content": "",
-            }
-        finally:
-            await browser.close()
-
+        rescored.sort(key=lambda x: x.get("similarity", 0.0), reverse=True)
+        if top_k:
+            rescored = rescored[: min(top_k, len(rescored))]
+        return rescored or results  # if all filtered out, return originals
+    except Exception as e:
+        print(e)
+        return results  # on embedding failure, do not block the pipeline
 
 async def run_search_and_fetch(
     question: str,
-    max_results: int = 5,
+    optimizer_llm: Any,
+    embedder: Any,
+    max_results: int = 20,
+    top_k: int = 5,
+    timelimit: Optional[str] = "m",
+    fetch_timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
-    print("run_search_and_fetch:start question=%s", question)
-
-    chain = build_search_query_chain()
+    """
+    Optimize the query, run DDGS search, and fetch page HTML.
+    Returns:
+      {
+        "question": ...,
+        "optimized_query": ...,
+        "search_results": [...],
+        "fetched_pages": [...]
+      }
+    """
+    if not question or not question.strip():
+        return {"error": "question must not be empty", "question": question}
+    t0 = time.monotonic()
+    chain = build_search_query_chain(optimizer_llm)
     schema: WebSearchQuerySchema = await chain.ainvoke({"question": question})
     optimized_query = schema.query.strip()
-    print("Optimized query: %s", optimized_query)
+    t_opt = time.monotonic()
 
-    search_raw = await _web_search_coroutine(optimized_query, max_results=max_results)
-    search_data = json.loads(search_raw) if isinstance(search_raw, str) else (search_raw or {})
-    results = search_data.get("results") or []
+    search_payload = await _run_ddgs(optimized_query, max_results=max_results, timelimit=timelimit)
+    results = search_payload.get("results") or []
+    t_ddg = time.monotonic()
+    results = await score_results(query=question, results=results, embedder=embedder, top_k=top_k, min_score=0.25) 
+    t_score = time.monotonic()
     urls = [entry["url"] for entry in results if entry.get("url")]
-    print("Collected %d URLs for fetching", len(urls))
 
-    fetched_pages = await asyncio.gather(*(fetch_clean_page_content(url) for url in urls)) if urls else []
+    fetched = await _fetch_pages(urls, timeout_ms=fetch_timeout_ms)
+    t_fetch = time.monotonic()
+    cleaned_pages: List[Dict[str, Any]] = []
+    for page in fetched:
+        html = page.get("html", "")
+        clean_text = _extract_clean_text(html) if html else ""
+        cleaned_pages.append({**page, "clean_text": clean_text})
+    timings = {
+    "total": time.monotonic() - t0,
+    "optimize": t_opt - t0,
+    "search": t_ddg - t_opt,
+    "fetch_clean": t_fetch - t_ddg,
+    "embed_score": t_score - t_ddg  # if you time score_results
+    }
 
-    payload = {
+    return {
         "question": question,
         "optimized_query": optimized_query,
         "search_results": results,
-        "fetched_pages": fetched_pages,
+        "fetched_pages": fetched,
+        "fetched_pages": cleaned_pages,
+        "search_error": search_payload.get("error"),
+        "timings": timings,
     }
-
-    print("run_search_and_fetch:end question=%s", question)
-    return payload
-
 
 async def run_search_with_summary(
+    optimizer_llm: Any,
+    summarizer_llm: Any,
+    embedder: Any,
     question: str,
-    max_results: int = 5,
-    # output_path: str = "debug_search/page_summaries.json",
+    max_results: int = 20,
+    top_k: int = 5,
+    final_results: int = 3,
+    timelimit: Optional[str] = "m",
+    fetch_timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
-    print("run_search_with_summary:start question=%s", question)
-
-    base_payload = await run_search_and_fetch(
+    
+    t0 = time.monotonic()
+    
+    base = await run_search_and_fetch(
         question=question,
-        max_results=max_results
+        max_results=max_results,
+        embedder=embedder,
+        timelimit=timelimit,
+        fetch_timeout_ms=fetch_timeout_ms,
+        optimizer_llm=optimizer_llm,
+        top_k=top_k, 
     )
 
-    print("Summarizing fetched page contents")
+    timings = dict(base.get("timings", {}))
     title_lookup = {
         entry.get("url"): entry.get("title") or entry.get("url")
-        for entry in base_payload.get("search_results", [])
+        for entry in base.get("search_results", [])
     }
 
-    summaries: List[Dict[str, Any]] = []
-    for page in base_payload.get("fetched_pages", []):
-        url = page.get("url")
-        clean_summary = await summarize_single_content(page.get("content", ""), question)
-        summaries.append(
-            {
-                "title": title_lookup.get(url, url),
-                "url": url,
-                "snippets": clean_summary or "NOT_RELEVANT",
-            }
-        )
+    scores: List[Dict[str, Any]] = []
+    summary_error = None
+    t_sum_start = time.monotonic()
+    try:
+        for page in base.get("fetched_pages", []):
+            url = page.get("url")
+            content = page.get("clean_text", "")
+            summary_obj = await summarize_single_content(content, question, summarizer_llm)
+            summary_text = summary_obj.get("summary") if isinstance(summary_obj, dict) else str(summary_obj)
+            score_val = summary_obj.get("score") if isinstance(summary_obj, dict) else None
 
-    payload = {
-        "query":question,
-        "result_count": len(summaries),
-        "results": summaries,
+            scores.append(
+                {
+                    "title": title_lookup.get(url, url),
+                    "url": url,
+                    "snippets": summary_text,
+                    "score": score_val,
+                }
+            )
+
+        # sort by score desc and keep top 3
+        scores.sort(key=lambda x: x.get("score", 0), reverse=True)
+        scores = scores[: min(final_results, len(scores))]
+
+    except Exception as exc:
+        summary_error = str(exc)
+
+    t_sum_end = time.monotonic()
+    timings["summaries"] = t_sum_end - t_sum_start
+    timings["total"] = time.monotonic() - t0
+
+    return {
+        "query": question,
+        "optimized_query": base.get("optimized_query"),
+        "result_count": len(scores),
+        "results": scores,
+        "search_results": base.get("search_results"),
+        "fetched_pages": base.get("fetched_pages"),
+        "search_error": base.get("search_error"),
+        "summary_error": summary_error,
+        "timings": timings,
     }
 
-    # debug_path = Path("debug_search/page_summaries.json")
-    # debug_path.parent.mkdir(parents=True, exist_ok=True)
-    # debug_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print("run_search_with_summary:end question=%s", question)
-    return payload
-
-
-if __name__ == "__main__":
-    user_query = "zero-copy deserialization Rust -serde -python site:github.com"
-    start_time = time.time()
-    asyncio.run(run_search_with_summary(question=user_query))
-    duration = time.time() - start_time
-    print(f"Completed in {duration:.2f} seconds")

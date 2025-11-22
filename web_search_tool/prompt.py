@@ -16,42 +16,21 @@ User question:
 {question}
 """
 
-PAGE_SUMMARY_PROMPT = """
-You are a precise summarizer.
-
-Given the user’s question and raw page content:
-1. Read both carefully.
-2. Write a concise summary (3–5 bullet points) that captures the key facts, numbers, or definitions that help answer the question.
-3. If the page does not mention the topic at all, still summarize the main facts you do find—do NOT output “NOT_RELEVANT.”
-4. Output ONLY bullet points; no prefaces, no explanations, no closing sentences.
+SUMMARY_WITH_SCORE_PROMPT = """
+You are a precise summarizer and relevance rater.
 
 User question:
 {question}
 
 Page content:
 {content}
-"""
 
+Tasks:
+1) Write a concise summary (3–5 bullet points) of the content that helps answer the question.
+2) Rate how relevant this page is to the question on a scale of 1–10 (1 = off-topic, 10 = directly answers).
 
-REDUCE_SUMMARY_PROMPT = """
-You are merging multiple brief summaries that already describe the same topic
-from a user-research perspective.
+If the content is empty or unavailable, still respond with summary="content unavailable" and score=0.
 
-Your job:
-- Read the user's original question.
-- Read the partial summaries (they are already filtered for relevance).
-- Combine them into one cohesive, deduplicated answer.
-- If two summaries contradict each other, note the disagreement clearly.
-- Preserve concrete facts, numbers, dates, and citations when available.
-- Do NOT invent new details or speculate beyond the provided summaries.
-
-Output:
-- 3–5 bullet points capturing the main takeaways.
-- End with one concise sentence (no more than 25 words) that directly answers the question or states that the information is insufficient.
-
-User question:
-{question}
-
-Partial summaries:
-{content}
+Respond ONLY in JSON like DONT ADD ANY KEY OR ANYTHING RESPOND EXACTLY IN THIS FORMAT NO ADDED TEXT NO ADDED KEYS:
+{{"summary": "<3-5 bullet points>", "score": <integer 1-10>}}
 """
