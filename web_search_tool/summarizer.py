@@ -1,6 +1,6 @@
 from typing import List
 from pydantic import BaseModel, Field
-from .prompt import SUMMARY_WITH_SCORE_PROMPT
+from prompt import SUMMARY_WITH_SCORE_PROMPT
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import json
 from dotenv import load_dotenv

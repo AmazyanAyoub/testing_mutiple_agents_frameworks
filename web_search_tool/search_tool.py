@@ -6,9 +6,9 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, Field
 
-from .prompt import SEARCH_QUERY_PROMPT
-from .filter_html import _extract_clean_text
-from .summarizer import summarize_single_content
+from prompt import SEARCH_QUERY_PROMPT
+from filter_html import _extract_clean_text
+from summarizer import summarize_single_content
 from provider.ddgs_provider import ddgs_search
 from provider.playwright_scraper import fetch_page_html
 
@@ -150,10 +150,37 @@ async def run_search_with_summary(
     final_results: int = 3,
     timelimit: Optional[str] = "m",
     fetch_timeout_ms: int = 30000,
+    mode: str = "default",  # new: "default" or "custom"
 ) -> Dict[str, Any]:
-    
+    """
+    mode="default": optimize the query and return only DDGS search results (no scraping, no summarization).
+    mode="custom": full pipeline (optimize -> search -> fetch -> clean -> summarize).
+    """
     t0 = time.monotonic()
-    
+    chain = build_search_query_chain(optimizer_llm)
+    schema: WebSearchQuerySchema = await chain.ainvoke({"question": question})
+    optimized_query = schema.query.strip()
+
+    # --- default mode: DDGS only ---
+    if mode == "default":
+        t_opt = time.monotonic()
+        search_payload = await _run_ddgs(optimized_query, max_results=max_results, timelimit=timelimit)
+        results = search_payload.get("results") or []
+        timings = {
+            "total": time.monotonic() - t0,
+            "optimize": t_opt - t0,
+            "search": time.monotonic() - t_opt,
+        }
+        return {
+            "query": question,
+            "optimized_query": optimized_query,
+            "result_count": len(results),
+            "results": results,
+            "search_error": search_payload.get("error"),
+            "timings": timings,
+        }
+
+    # --- custom mode: full pipeline ---
     base = await run_search_and_fetch(
         question=question,
         max_results=max_results,
@@ -161,39 +188,48 @@ async def run_search_with_summary(
         timelimit=timelimit,
         fetch_timeout_ms=fetch_timeout_ms,
         optimizer_llm=optimizer_llm,
-        top_k=top_k, 
+        top_k=top_k,
     )
-
     timings = dict(base.get("timings", {}))
-    title_lookup = {
-        entry.get("url"): entry.get("title") or entry.get("url")
-        for entry in base.get("search_results", [])
-    }
+    title_lookup = {entry.get("url"): entry.get("title") or entry.get("url") for entry in base.get("search_results", [])}
 
     scores: List[Dict[str, Any]] = []
     summary_error = None
     t_sum_start = time.monotonic()
+    # try:
+    #     for page in base.get("fetched_pages", []):
+    #         url = page.get("url")
+    #         content = page.get("clean_text", "")
+    #         summary_obj = await summarize_single_content(content, question, summarizer_llm)
+    #         summary_text = summary_obj.get("summary") if isinstance(summary_obj, dict) else str(summary_obj)
+    #         score_val = summary_obj.get("score") if isinstance(summary_obj, dict) else None
+    #         scores.append({"title": title_lookup.get(url, url), "url": url, "snippets": summary_text, "score": score_val})
+    #     scores.sort(key=lambda x: x.get("score", 0), reverse=True)
+    #     scores = scores[: min(final_results, len(scores))]
+    # except Exception as exc:
+    #     summary_error = str(exc)
     try:
-        for page in base.get("fetched_pages", []):
+        sem = asyncio.Semaphore(3)  # adjust concurrency as needed
+
+        async def summarize_page(page):
             url = page.get("url")
             content = page.get("clean_text", "")
-            summary_obj = await summarize_single_content(content, question, summarizer_llm)
+            async with sem:
+                summary_obj = await summarize_single_content(content, question, summarizer_llm)
             summary_text = summary_obj.get("summary") if isinstance(summary_obj, dict) else str(summary_obj)
             score_val = summary_obj.get("score") if isinstance(summary_obj, dict) else None
+            return {
+                "title": title_lookup.get(url, url),
+                "url": url,
+                "snippets": summary_text,
+                "score": score_val,
+            }
 
-            scores.append(
-                {
-                    "title": title_lookup.get(url, url),
-                    "url": url,
-                    "snippets": summary_text,
-                    "score": score_val,
-                }
-            )
-
-        # sort by score desc and keep top 3
+        tasks = [summarize_page(p) for p in base.get("fetched_pages", [])]
+        scores = await asyncio.gather(*tasks)
+        scores = [s for s in scores if s is not None]
         scores.sort(key=lambda x: x.get("score", 0), reverse=True)
         scores = scores[: min(final_results, len(scores))]
-
     except Exception as exc:
         summary_error = str(exc)
 
@@ -212,4 +248,5 @@ async def run_search_with_summary(
         "summary_error": summary_error,
         "timings": timings,
     }
+
 
